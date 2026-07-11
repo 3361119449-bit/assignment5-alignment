@@ -327,9 +327,9 @@ def get_response_log_probs(
     }
 
     if return_token_entropy:
-        probs_all = torch.exp(log_probs_all)
+        probs_all = torch.exp(log_probs_all.detach())
 
-        token_entropy = -(probs_all * log_probs_all).sum(dim=-1)
+        token_entropy = -(probs_all * log_probs_all.detach()).sum(dim=-1)
 
         result["token_entropy"] = token_entropy
 
@@ -558,100 +558,138 @@ import torch
 def compute_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
-    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+    importance_reweighting_method: Literal[
+        "none", "noclip", "grpo", "gspo"
+    ] = "none",
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
     response_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """
-    Args:
-        raw_rewards_or_advantages:
-            shape = (batch_size,) 或 (batch_size, 1)，每条 rollout 的 reward/advantage。
 
-        policy_log_probs:
-            shape = (batch_size, sequence_length)，当前 policy 的 per-token log probability。
+# 旧概率必须固定，但不一定必须显式调用 detach()；如果它已经在 no_grad 下计算，就不用。
 
-        importance_reweighting_method:
-            当前 on-policy 版本只支持 "none"。
-
-        old_log_probs:
-            off-policy 时使用；当前不用。
-
-        cliprange:
-            off-policy clipping 时使用；当前不用。
-
-        response_mask:
-            shape = (batch_size, sequence_length)，当前函数不用，后续聚合 loss 时使用。
-
-    Returns:
-        per_token_policy_gradient_loss:
-            shape = (batch_size, sequence_length)，每个 token 的 policy-gradient loss。
-
-        metadata:
-            dict[str, torch.Tensor]，当前 on-policy 版本返回空 dict。
-    """
-
-    if importance_reweighting_method != "none":
-        raise NotImplementedError
-
+    # (batch_size,) -> (batch_size, 1)
     advantages = raw_rewards_or_advantages.reshape(-1, 1)
-
-    per_token_policy_gradient_loss = -advantages * policy_log_probs
 
     metadata = {}
 
+    # 1. On-policy
+    if importance_reweighting_method == "none":
+        per_token_policy_gradient_loss = (
+            -advantages * policy_log_probs
+        )
+
+    # 2. Token-level importance weighting，不裁剪
+    elif importance_reweighting_method == "noclip":
+        log_ratio = policy_log_probs - old_log_probs
+        w_t = torch.exp(log_ratio)
+
+        per_token_policy_gradient_loss = -advantages * w_t
+
+        metadata["importance_weight_mean"] = (
+            w_t.detach().mean()
+        )
+
+    # 3. PPO / GRPO token-level clipping
+    elif importance_reweighting_method == "grpo":
+        log_ratio = policy_log_probs - old_log_probs
+        w_t = torch.exp(log_ratio)
+
+        clipped_w_t = torch.clamp(
+            w_t,
+            1 - cliprange,
+            1 + cliprange,
+        )
+
+        loss1 = advantages * w_t
+        loss2 = advantages * clipped_w_t
+
+        per_token_policy_gradient_loss = -torch.minimum(
+            loss1,
+            loss2,
+        )
+
+        clipped = (
+            ((advantages >= 0) & (w_t > 1 + cliprange))
+            | ((advantages < 0) & (w_t < 1 - cliprange))
+        )
+
+        metadata["importance_weight_mean"] = (
+            w_t.detach().mean()
+        )
+        metadata["clip_fraction"] = (
+            clipped.detach().float().mean()
+        )
+
+    # 4. GSPO sequence-level geometric-mean weighting
+    elif importance_reweighting_method == "gspo":
+        log_ratio = policy_log_probs - old_log_probs
+
+        mask = response_mask.bool()
+
+        sequence_length = mask.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1)
+
+        sequence_log_ratio = (
+            (log_ratio * mask).sum(dim=-1, keepdim=True)
+            / sequence_length
+        )
+        # s = geometric mean of token-level ratios
+        sequence_weight = torch.exp(sequence_log_ratio)
+
+        clipped_sequence_weight = torch.clamp(
+            sequence_weight,
+            1 - cliprange,
+            1 + cliprange,
+        )
+
+        loss1 = advantages * sequence_weight
+        loss2 = advantages * clipped_sequence_weight
+
+        sequence_loss = -torch.minimum(loss1, loss2)
+
+        # 一个 sequence 内所有 token 共享同一个 GSPO loss#统一函数的输出形状
+        per_token_policy_gradient_loss = sequence_loss.expand_as(
+            policy_log_probs
+        )
+
+        clipped = (
+            (
+                (advantages >= 0)
+                & (sequence_weight > 1 + cliprange)
+            )
+            | (
+                (advantages < 0)
+                & (sequence_weight < 1 - cliprange)
+            )
+        )
+
+        metadata["importance_weight_mean"] = (
+            sequence_weight.detach().mean()
+        )
+        metadata["clip_fraction"] = (
+            clipped.detach().float().mean()
+        )
+
     return per_token_policy_gradient_loss, metadata
+
+# 因为标准的 on-policy GRPO 想要的不是某个具体函数值，而是下面这个 policy-gradient,所以重采样时候不乘以log，grpo要乘以log
+# 详细讲一下，我记得是因为直接计算需要多次计算，而换成另外的l就可以一次计算，并分析为什么重采样不需要
+    # J=min(Aw,Aclip(w,1−ϵ,1+ϵ))#########################################  torch.clamp
+
 
 # Problem (aggregate_loss_across_microbatch_sequence): Aggregate loss across tokens and
 # sequences (0.5 points)
 from typing import Literal
 import torch
 
-def aggregate_loss_across_microbatch(
-per_token_policy_gradient_loss: torch.Tensor,
-mask: torch.Tensor,
-loss_normalization: Literal["sequence", "constant"] = "sequence",
-normalization_constant: int | None = None,
-) -> torch.Tensor:
-    """
-    Args:
-        per_token_policy_gradient_loss:
-            shape = (batch_size, sequence_length)
-            每个 token 位置上的 policy-gradient loss。
-
-        mask:
-            shape = (batch_size, sequence_length)
-            response token 位置为 1，其余位置为 0。
-
-        loss_normalization:
-            "sequence":
-                每条 sequence 内先对 response token 求平均，
-                再对 batch 求平均。
-
-            "constant":
-                后续 Dr. GRPO 会用到；当前 sequence 版本可以先不实现。
-
-        normalization_constant:
-            loss_normalization="constant" 时使用。
-
-    Returns:
-        loss:
-            scalar tensor，聚合后的标量 loss。
-    """
-    len_y=mask.sum(dim=-1,keepdim=True)
-    BG=mask.shape[0]
-    per_token_policy_gradient_loss = (per_token_policy_gradient_loss.masked_fill(~mask.bool(), float(0))/len_y).sum(dim=-1)
-    per_token_policy_gradient_loss=per_token_policy_gradient_loss.sum()/BG
-
-    return per_token_policy_gradient_loss
-
-
-
 # def aggregate_loss_across_microbatch(
-#     per_token_policy_gradient_loss: torch.Tensor,
-#     mask: torch.Tensor,
-#     loss_normalization: Literal["sequence", "constant"] = "sequence",
-#     normalization_constant: int | None = None,
+# per_token_policy_gradient_loss: torch.Tensor,
+# mask: torch.Tensor,
+# loss_normalization: Literal["sequence", "constant"] = "sequence",
+# normalization_constant: int | None = None,
 # ) -> torch.Tensor:
 #     """
 #     Args:
@@ -678,22 +716,43 @@ normalization_constant: int | None = None,
 #         loss:
 #             scalar tensor，聚合后的标量 loss。
 #     """
+#     len_y=mask.sum(dim=-1,keepdim=True)
+#     BG=mask.shape[0]
+#     per_token_policy_gradient_loss = (per_token_policy_gradient_loss.masked_fill(~mask.bool(), float(0))/len_y).sum(dim=-1)
+#     per_token_policy_gradient_loss=per_token_policy_gradient_loss.sum()/BG
 
-#     len_y = mask.sum(dim=-1, keepdim=True)
+#     return per_token_policy_gradient_loss
 
-#     batch_size = mask.shape[0]
 
-#     loss = (
-#         per_token_policy_gradient_loss.masked_fill(
-#             ~mask.bool(),
-#             0.0,
-#         )
-#         / len_y
-#     ).sum(dim=-1)
 
-#     loss = loss.sum() / batch_size
+def aggregate_loss_across_microbatch(
+    per_token_policy_gradient_loss: torch.Tensor,
+    mask: torch.Tensor,
+    loss_normalization: Literal["sequence", "constant"] = "sequence",
+    normalization_constant: int | None = None,
+) -> torch.Tensor:
+    
+    mask_bool = mask.bool()
+    masked_loss = per_token_policy_gradient_loss.masked_fill(~mask_bool, 0.0)
 
-#     return loss
+    if loss_normalization == "sequence":
+        len_y = mask_bool.sum(dim=-1).clamp_min(1)
+        per_sequence_loss = masked_loss.sum(dim=-1) / len_y
+        loss = per_sequence_loss.mean()
+        return loss
+
+    if loss_normalization == "constant":
+        if normalization_constant is None:
+            raise ValueError(
+                "normalization_constant must be provided when "
+                "loss_normalization='constant'."
+            )
+
+        return masked_loss.sum() / normalization_constant
+
+    raise NotImplementedError(
+        f"Unsupported loss_normalization: {loss_normalization}"
+    )
 
 
 
@@ -840,7 +899,7 @@ def grpo_train_step(
         rollout_responses,
         repeated_ground_truths,
     )
-
+    raw_rewards = raw_rewards.to(device)
     advantages, advantage_metadata = compute_group_normalized_rewards(
         raw_rewards,
         group_size,
@@ -849,7 +908,7 @@ def grpo_train_step(
         advantage_normalizer=advantage_normalizer,
     )
 
-    advantages = advantages.to(device)
+    advantages = advantages
 
     if old_log_probs is not None:
         old_log_probs = old_log_probs.to(device)
@@ -974,3 +1033,4 @@ def grpo_train_step(
             metadata[key] = value
 
     return total_loss.detach(), metadata
+    # return float(total_loss.detach().cpu().item()), metadata
